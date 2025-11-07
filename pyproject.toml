@@ -1,0 +1,24 @@
+[project]
+name = "dbcake"
+readme = "README.md"
+description = "database python library."
+authors = [
+  { name = "Cielecon" }
+]
+requires-python = ">=3.8"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent"
+]
+dynamic = ["version"]
+
+[tool.setuptools]
+py-modules = ["dbcake"]
+
+[tool.setuptools_scm]
+write_to = "dbcake_version.py"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "setuptools_scm"]
+build-backend = "setuptools.build_meta"
