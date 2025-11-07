@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61", "wheel", "build"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbcake"
+version = "0.1.0"
+description = "A sweet Python package for database utilities"
+readme = "README.md"
+authors = [{ name = "Armin Ghassemi" }]
+license = { text = "MIT" }
+dependencies = ["requests"]
+requires-python = ">=3.8"
+
+[project.urls]
+Homepage = "https://github.com/Cielecon/dbcake"
