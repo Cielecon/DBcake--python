@@ -81,7 +81,7 @@ dbcake.db.set("a", 123)
 print(dbcake.db.get("a"))           # -> 123
 
 # Change file & format
-dbcake.db.title("mydata.dbce", store_format="binary")
+dbcake.db.reconfigure("mydata.dbce", store_format="binary")
 dbcake.db.set("user", {"name": "alice"})
 print(dbcake.db.get("user"))
 
