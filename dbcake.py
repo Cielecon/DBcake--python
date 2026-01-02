@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 DBcake: Best database for everyone!
-Version: 1.4
+Version: 1.4.1
 """
 
 import os
@@ -75,8 +75,8 @@ class EncryptionLevel(Enum):
 
 class Operation(Enum):
     """Database operations."""
-    SET = "SET"
-    DELETE = "DEL"
+    SET = "S"
+    DELETE = "D"
 
 # ============================================================================
 # List and Tuple Manager
@@ -311,17 +311,17 @@ class Record:
         # Convert metadata to JSON bytes
         meta_bytes = json.dumps(self.metadata).encode('utf-8')
         
-        # Pack structure
+        # Pack structure - using single character for operation
         packed = struct.pack(
-            '!dI I I',
+            '!d I I I',
             self.timestamp,
-            self.operation.value.encode('ascii')[0],  # Single byte for operation
+            len(self.operation.value),  # Store operation as single character
             len(self.key),
             len(meta_bytes)
         )
         
         # Add variable length fields
-        result = packed + self.key.encode('utf-8') + meta_bytes
+        result = packed + self.operation.value.encode('ascii') + self.key.encode('utf-8') + meta_bytes
         if self.value:
             result += struct.pack('!I', len(self.value)) + self.value
         else:
@@ -332,30 +332,59 @@ class Record:
     @classmethod
     def deserialize(cls, data: bytes) -> 'Record':
         """Deserialize record from bytes."""
-        # Read fixed header
-        timestamp, op_byte, key_len, meta_len = struct.unpack('!dI I I', data[:20])
-        
-        # Parse variable fields
-        offset = 20
-        key = data[offset:offset + key_len].decode('utf-8')
-        offset += key_len
-        
-        metadata = json.loads(data[offset:offset + meta_len].decode('utf-8'))
-        offset += meta_len
-        
-        # Read value length and value
-        value_len = struct.unpack('!I', data[offset:offset + 4])[0]
-        offset += 4
-        
-        value = data[offset:offset + value_len] if value_len > 0 else None
-        
-        return cls(
-            timestamp=timestamp,
-            operation=Operation(chr(op_byte)),
-            key=key,
-            value=value,
-            metadata=metadata
-        )
+        try:
+            # Read fixed header
+            timestamp, op_len, key_len, meta_len = struct.unpack('!d I I I', data[:20])
+            
+            # Parse variable fields
+            offset = 20
+            
+            # Read operation (should be 1 byte for 'S' or 'D')
+            operation_str = data[offset:offset + op_len].decode('ascii')
+            offset += op_len
+            
+            # Convert operation string to Operation enum
+            try:
+                operation = Operation(operation_str)
+            except ValueError:
+                # Default to SET if unknown operation
+                operation = Operation.SET
+            
+            # Read key
+            key = data[offset:offset + key_len].decode('utf-8')
+            offset += key_len
+            
+            # Read metadata
+            metadata = {}
+            if meta_len > 0:
+                try:
+                    metadata = json.loads(data[offset:offset + meta_len].decode('utf-8'))
+                except:
+                    metadata = {}
+            offset += meta_len
+            
+            # Read value length and value
+            value_len = struct.unpack('!I', data[offset:offset + 4])[0]
+            offset += 4
+            
+            value = data[offset:offset + value_len] if value_len > 0 else None
+            
+            return cls(
+                timestamp=timestamp,
+                operation=operation,
+                key=key,
+                value=value,
+                metadata=metadata
+            )
+        except Exception as e:
+            # If deserialization fails, return a dummy record
+            return cls(
+                timestamp=time.time(),
+                operation=Operation.SET,
+                key="corrupted",
+                value=None,
+                metadata={"error": str(e)}
+            )
 
 @dataclass
 class Secret:
@@ -427,22 +456,35 @@ class AppendOnlyStorage(StorageBackend):
                 if not len_bytes or len(len_bytes) < 4:
                     break
                 
-                record_len = struct.unpack('!I', len_bytes)[0]
+                try:
+                    record_len = struct.unpack('!I', len_bytes)[0]
+                except:
+                    # Corrupted length data, skip to end
+                    break
+                    
                 position += 4
                 
                 # Read record
                 record_data = f.read(record_len)
                 if len(record_data) < record_len:
+                    # Incomplete record, skip
                     break
                 
-                record = Record.deserialize(record_data)
-                position += record_len
-                
-                # Update key index
-                if record.operation == Operation.SET:
-                    self._current_keys[record.key] = (position - record_len - 4, record)
-                elif record.operation == Operation.DELETE:
-                    self._current_keys.pop(record.key, None)
+                try:
+                    record = Record.deserialize(record_data)
+                    position += record_len
+                    
+                    # Update key index
+                    if record.operation == Operation.SET:
+                        self._current_keys[record.key] = (position - record_len - 4, record)
+                    elif record.operation == Operation.DELETE:
+                        self._current_keys.pop(record.key, None)
+                except Exception as e:
+                    # Skip corrupted record
+                    print(f"Warning: Skipping corrupted record at position {position}: {e}")
+                    # Try to continue reading
+                    if len(record_data) > 0:
+                        position += len(record_data)
     
     def _append_record(self, record: Record) -> None:
         """Append a record to the file."""
@@ -461,7 +503,13 @@ class AppendOnlyStorage(StorageBackend):
             metadata=metadata
         )
         self._append_record(record)
-        self._current_keys[key] = (self.path.stat().st_size - len(record.serialize()) - 4, record)
+        
+        # Update current keys dictionary
+        if self.path.exists():
+            file_size = self.path.stat().st_size
+            self._current_keys[key] = (file_size - len(record.serialize()) - 4, record)
+        else:
+            self._current_keys[key] = (0, record)
     
     def get(self, key: str) -> Optional[bytes]:
         if key in self._current_keys:
@@ -497,10 +545,11 @@ class AppendOnlyStorage(StorageBackend):
                     out_f.write(record_data)
             
             # Replace original file
-            self.path.unlink(missing_ok=True)
+            if self.path.exists():
+                self.path.unlink()
             temp_path.rename(self.path)
             
-            # Reload
+            # Clear and reload
             self._current_keys.clear()
             self._load()
     
@@ -511,9 +560,24 @@ class AppendOnlyStorage(StorageBackend):
             if i >= limit:
                 break
             try:
-                value_str = record.value.decode('utf-8') if record.value else None
+                if record.value:
+                    # Try to decode as JSON first
+                    try:
+                        decoded = json.loads(record.value.decode('utf-8'))
+                        if isinstance(decoded, (dict, list, tuple)):
+                            value_str = str(decoded)[:100]
+                        else:
+                            value_str = str(decoded)
+                    except:
+                        # Try as plain string
+                        try:
+                            value_str = record.value.decode('utf-8')
+                        except:
+                            value_str = f"<binary: {len(record.value)} bytes>"
+                else:
+                    value_str = None
             except:
-                value_str = f"<binary: {len(record.value) if record.value else 0} bytes>"
+                value_str = f"<error reading value>"
             
             result.append({
                 'key': key,
@@ -533,20 +597,21 @@ class DecentralizedStorage(StorageBackend):
     
     def _key_path(self, key: str) -> pathlib.Path:
         """Get file path for a key."""
-        safe_key = base64.urlsafe_b64encode(key.encode('utf-8')).decode('ascii')
-        return self.path / f"{safe_key}.key"
+        # Use hash to avoid special characters in filenames
+        key_hash = hashlib.md5(key.encode('utf-8')).hexdigest()
+        return self.path / f"{key_hash}.key"
     
     def set(self, key: str, value: bytes, metadata: Optional[Dict] = None) -> None:
         metadata = metadata or {}
         data = {
+            'key': key,
             'value': base64.b64encode(value).decode('ascii') if value else None,
             'metadata': metadata,
-            'timestamp': time.time(),
-            'key': key
+            'timestamp': time.time()
         }
         
         with self.lock:
-            with open(self._key_path(key), 'w') as f:
+            with open(self._key_path(key), 'w', encoding='utf-8') as f:
                 json.dump(data, f)
     
     def get(self, key: str) -> Optional[bytes]:
@@ -555,26 +620,33 @@ class DecentralizedStorage(StorageBackend):
             return None
         
         with self.lock:
-            with open(path, 'r') as f:
-                data = json.load(f)
-            
-            if data['value']:
-                return base64.b64decode(data['value'].encode('ascii'))
-            return None
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                if data.get('value'):
+                    return base64.b64decode(data['value'].encode('ascii'))
+                return None
+            except:
+                return None
     
     def delete(self, key: str) -> None:
         path = self._key_path(key)
         if path.exists():
             with self.lock:
-                path.unlink()
+                try:
+                    path.unlink()
+                except:
+                    pass
     
     def keys(self) -> List[str]:
         keys = []
         for file in self.path.glob("*.key"):
             try:
-                with open(file, 'r') as f:
+                with open(file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                keys.append(data['key'])
+                if 'key' in data:
+                    keys.append(data['key'])
             except:
                 continue
         return keys
@@ -592,9 +664,24 @@ class DecentralizedStorage(StorageBackend):
             
             value = self.get(key)
             try:
-                value_str = value.decode('utf-8') if value else None
+                if value:
+                    # Try to decode as JSON first
+                    try:
+                        decoded = json.loads(value.decode('utf-8'))
+                        if isinstance(decoded, (dict, list, tuple)):
+                            value_str = str(decoded)[:100]
+                        else:
+                            value_str = str(decoded)
+                    except:
+                        # Try as plain string
+                        try:
+                            value_str = value.decode('utf-8')
+                        except:
+                            value_str = f"<binary: {len(value)} bytes>"
+                else:
+                    value_str = None
             except:
-                value_str = f"<binary: {len(value) if value else 0} bytes>"
+                value_str = f"<error reading value>"
             
             result.append({
                 'key': key,
@@ -687,16 +774,26 @@ class EncryptionManager:
         
         if CRYPTOGRAPHY_AVAILABLE and self.level == EncryptionLevel.HIGH:
             # AES-GCM
+            if len(encrypted_data) < 12:
+                return encrypted_data
             nonce = encrypted_data[:12]
             ciphertext = encrypted_data[12:]
-            aesgcm = AESGCM(self._key)
-            return aesgcm.decrypt(nonce, ciphertext, None)
+            try:
+                aesgcm = AESGCM(self._key)
+                return aesgcm.decrypt(nonce, ciphertext, None)
+            except:
+                return encrypted_data
         else:
             # Fallback
+            if len(encrypted_data) < 28:
+                return encrypted_data
             nonce = encrypted_data[:12]
             auth_tag = encrypted_data[12:28]
             ciphertext = encrypted_data[28:]
-            return CryptoFallback.decrypt(ciphertext, self._key, nonce, auth_tag)
+            try:
+                return CryptoFallback.decrypt(ciphertext, self._key, nonce, auth_tag)
+            except:
+                return encrypted_data
     
     def rotate_key(self, new_passphrase: Optional[str] = None) -> None:
         """Rotate to a new key."""
@@ -750,10 +847,14 @@ class DBCake:
         elif isinstance(value, bytes):
             value_bytes = value
         else:
-            value_bytes = json.dumps(value).encode('utf-8')
+            try:
+                value_bytes = json.dumps(value, ensure_ascii=False).encode('utf-8')
+            except:
+                # Fallback for non-serializable objects
+                value_bytes = str(value).encode('utf-8')
         
         # Encrypt if needed
-        if self.encryption_level != EncryptionLevel.LOW:
+        if self.encryption_level != EncryptionLevel.LOW and self.encryption._key:
             value_bytes = self.encryption.encrypt(value_bytes)
         
         self._backend.set(key, value_bytes)
@@ -765,16 +866,17 @@ class DBCake:
             return None
         
         # Decrypt if needed
-        if self.encryption_level != EncryptionLevel.LOW:
+        if self.encryption_level != EncryptionLevel.LOW and self.encryption._key:
             try:
                 value_bytes = self.encryption.decrypt(value_bytes)
             except:
-                # If decryption fails, return raw bytes
-                return value_bytes
+                # If decryption fails, try to use raw bytes
+                pass
         
         # Try to decode as JSON, then as string
         try:
-            return json.loads(value_bytes.decode('utf-8'))
+            decoded = json.loads(value_bytes.decode('utf-8'))
+            return decoded
         except:
             try:
                 return value_bytes.decode('utf-8')
@@ -807,13 +909,9 @@ class DBCake:
     
     def rotate_key(self, new_passphrase: Optional[str] = None) -> None:
         """Rotate encryption key."""
-        # Implementation would need to re-encrypt all data
-        # This is a simplified version
+        # This is a simplified version - would need to re-encrypt all data
         if new_passphrase:
-            old_key = self.encryption._key
             self.encryption.set_passphrase(new_passphrase)
-            # Here we would iterate through all keys and re-encrypt
-            # For now, just update the key
             
             # Delete old keyfile if exists
             key_path = self.path.parent / (self.path.stem + '.key')
@@ -823,14 +921,14 @@ class DBCake:
     def centralized(self) -> None:
         """Switch to centralized mode."""
         if self.dataset_mode != DatasetMode.CENTERILIZED:
-            # Would need to migrate data
+            # Note: This would need data migration
             self.dataset_mode = DatasetMode.CENTERILIZED
             self._backend = AppendOnlyStorage(self.path, self.store_format)
     
     def decentralized(self) -> None:
         """Switch to decentralized mode."""
         if self.dataset_mode != DatasetMode.DECENTRALIZED:
-            # Would need to migrate data
+            # Note: This would need data migration
             self.dataset_mode = DatasetMode.DECENTRALIZED
             storage_dir = self.path.parent / (self.path.stem + '.d')
             self._backend = DecentralizedStorage(storage_dir, self.store_format)
@@ -838,7 +936,7 @@ class DBCake:
     def set_format(self, format: Union[str, StoreFormat]) -> None:
         """Change storage format."""
         self.store_format = StoreFormat(format)
-        # Would need to convert existing data
+        # Note: Would need to convert existing data
     
     def pretty_print_preview(self, limit: int = 10) -> None:
         """Pretty print preview."""
@@ -847,17 +945,17 @@ class DBCake:
             print("No records found.")
             return
         
-        print(f"{'Key':<20} {'Value':<30} {'Timestamp':<20}")
-        print("-" * 70)
+        print(f"{'Key':<20} {'Value':<40} {'Timestamp':<20}")
+        print("-" * 85)
         for record in preview:
             key = record['key'][:18] + '..' if len(record['key']) > 20 else record['key']
             value = str(record['value'])
-            value = value[:28] + '..' if len(value) > 30 else value
+            value = value[:38] + '..' if len(value) > 40 else value
             timestamp = record.get('timestamp', 'N/A')
             if isinstance(timestamp, float):
                 timestamp = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
             
-            print(f"{key:<20} {value:<30} {timestamp:<20}")
+            print(f"{key:<20} {value:<40} {timestamp:<20}")
 
 # ============================================================================
 # Secrets Client
