@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 DBcake: Best database for everyone!
-Version: 1.4.1
+Version: 1.4.2
 """
-
 import os
 import sys
 import json
@@ -51,6 +50,13 @@ try:
 except ImportError:
     AIOHTTP_AVAILABLE = False
 
+# Try to import requests for HTTP client
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
 # ============================================================================
 # Constants & Enums
 # ============================================================================
@@ -77,6 +83,34 @@ class Operation(Enum):
     """Database operations."""
     SET = "S"
     DELETE = "D"
+
+# ============================================================================
+# Custom Exceptions
+# ============================================================================
+
+class DBCakeError(Exception):
+    """Base exception for dbcake errors."""
+    pass
+
+class DatabaseError(DBCakeError):
+    """Database-related errors."""
+    pass
+
+class CorruptedDatabaseError(DatabaseError):
+    """Database file is corrupted."""
+    pass
+
+class ConfigurationError(DBCakeError):
+    """Configuration errors."""
+    pass
+
+class NetworkError(DBCakeError):
+    """Network-related errors."""
+    pass
+
+class SecretClientError(DBCakeError):
+    """Secrets client errors."""
+    pass
 
 # ============================================================================
 # List and Tuple Manager
@@ -448,50 +482,56 @@ class AppendOnlyStorage(StorageBackend):
         if not self.path.exists():
             return
         
-        with open(self.path, 'rb') as f:
-            position = 0
-            while True:
-                # Read record length
-                len_bytes = f.read(4)
-                if not len_bytes or len(len_bytes) < 4:
-                    break
-                
-                try:
-                    record_len = struct.unpack('!I', len_bytes)[0]
-                except:
-                    # Corrupted length data, skip to end
-                    break
+        try:
+            with open(self.path, 'rb') as f:
+                position = 0
+                while True:
+                    # Read record length
+                    len_bytes = f.read(4)
+                    if not len_bytes or len(len_bytes) < 4:
+                        break
                     
-                position += 4
-                
-                # Read record
-                record_data = f.read(record_len)
-                if len(record_data) < record_len:
-                    # Incomplete record, skip
-                    break
-                
-                try:
-                    record = Record.deserialize(record_data)
-                    position += record_len
+                    try:
+                        record_len = struct.unpack('!I', len_bytes)[0]
+                    except:
+                        # Corrupted length data, skip to end
+                        break
+                        
+                    position += 4
                     
-                    # Update key index
-                    if record.operation == Operation.SET:
-                        self._current_keys[record.key] = (position - record_len - 4, record)
-                    elif record.operation == Operation.DELETE:
-                        self._current_keys.pop(record.key, None)
-                except Exception as e:
-                    # Skip corrupted record
-                    print(f"Warning: Skipping corrupted record at position {position}: {e}")
-                    # Try to continue reading
-                    if len(record_data) > 0:
-                        position += len(record_data)
+                    # Read record
+                    record_data = f.read(record_len)
+                    if len(record_data) < record_len:
+                        # Incomplete record, skip
+                        break
+                    
+                    try:
+                        record = Record.deserialize(record_data)
+                        position += record_len
+                        
+                        # Update key index
+                        if record.operation == Operation.SET:
+                            self._current_keys[record.key] = (position - record_len - 4, record)
+                        elif record.operation == Operation.DELETE:
+                            self._current_keys.pop(record.key, None)
+                    except Exception as e:
+                        # Skip corrupted record
+                        print(f"Warning: Skipping corrupted record at position {position}: {e}")
+                        # Try to continue reading
+                        if len(record_data) > 0:
+                            position += len(record_data)
+        except Exception as e:
+            raise CorruptedDatabaseError(f"Failed to load database file '{self.path}': {e}")
     
     def _append_record(self, record: Record) -> None:
         """Append a record to the file."""
-        with self.lock, open(self.path, 'ab') as f:
-            record_data = record.serialize()
-            f.write(struct.pack('!I', len(record_data)))
-            f.write(record_data)
+        try:
+            with self.lock, open(self.path, 'ab') as f:
+                record_data = record.serialize()
+                f.write(struct.pack('!I', len(record_data)))
+                f.write(record_data)
+        except Exception as e:
+            raise DatabaseError(f"Failed to write to database '{self.path}': {e}")
     
     def set(self, key: str, value: bytes, metadata: Optional[Dict] = None) -> None:
         metadata = metadata or {}
@@ -537,21 +577,30 @@ class AppendOnlyStorage(StorageBackend):
         temp_path = self.path.with_suffix('.dbce.tmp')
         
         with self.lock:
-            # Write all current records to temp file
-            with open(temp_path, 'wb') as out_f:
-                for key, (_, record) in self._current_keys.items():
-                    record_data = record.serialize()
-                    out_f.write(struct.pack('!I', len(record_data)))
-                    out_f.write(record_data)
-            
-            # Replace original file
-            if self.path.exists():
-                self.path.unlink()
-            temp_path.rename(self.path)
-            
-            # Clear and reload
-            self._current_keys.clear()
-            self._load()
+            try:
+                # Write all current records to temp file
+                with open(temp_path, 'wb') as out_f:
+                    for key, (_, record) in self._current_keys.items():
+                        record_data = record.serialize()
+                        out_f.write(struct.pack('!I', len(record_data)))
+                        out_f.write(record_data)
+                
+                # Replace original file
+                if self.path.exists():
+                    self.path.unlink()
+                temp_path.rename(self.path)
+                
+                # Clear and reload
+                self._current_keys.clear()
+                self._load()
+            except Exception as e:
+                # Clean up temp file if it exists
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except:
+                        pass
+                raise DatabaseError(f"Failed to compact database '{self.path}': {e}")
     
     def preview(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Preview records."""
@@ -593,7 +642,10 @@ class DecentralizedStorage(StorageBackend):
     def __init__(self, path: pathlib.Path, format: StoreFormat = StoreFormat.BINARY):
         super().__init__(path)
         self.format = format
-        self.path.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            raise DatabaseError(f"Failed to create storage directory '{path}': {e}")
     
     def _key_path(self, key: str) -> pathlib.Path:
         """Get file path for a key."""
@@ -611,8 +663,11 @@ class DecentralizedStorage(StorageBackend):
         }
         
         with self.lock:
-            with open(self._key_path(key), 'w', encoding='utf-8') as f:
-                json.dump(data, f)
+            try:
+                with open(self._key_path(key), 'w', encoding='utf-8') as f:
+                    json.dump(data, f)
+            except Exception as e:
+                raise DatabaseError(f"Failed to set key '{key}' in decentralized storage: {e}")
     
     def get(self, key: str) -> Optional[bytes]:
         path = self._key_path(key)
@@ -706,6 +761,9 @@ class EncryptionManager:
         
     def set_passphrase(self, passphrase: str) -> None:
         """Set passphrase and derive key."""
+        if not passphrase:
+            raise ConfigurationError("Passphrase cannot be empty")
+        
         self._passphrase = passphrase
         
         if self.level == EncryptionLevel.LOW:
@@ -713,13 +771,16 @@ class EncryptionManager:
         else:
             # Generate or load salt
             salt_path = self.db_path.parent / (self.db_path.stem + '.salt')
-            if salt_path.exists():
-                with open(salt_path, 'rb') as f:
-                    salt = f.read()
-            else:
-                salt = secrets.token_bytes(16)
-                with open(salt_path, 'wb') as f:
-                    f.write(salt)
+            try:
+                if salt_path.exists():
+                    with open(salt_path, 'rb') as f:
+                        salt = f.read()
+                else:
+                    salt = secrets.token_bytes(16)
+                    with open(salt_path, 'wb') as f:
+                        f.write(salt)
+            except Exception as e:
+                raise DatabaseError(f"Failed to handle salt file '{salt_path}': {e}")
             
             if CRYPTOGRAPHY_AVAILABLE and self.level == EncryptionLevel.HIGH:
                 # Use PBKDF2 from cryptography if available
@@ -741,15 +802,21 @@ class EncryptionManager:
         if self._key is None:
             self._key = secrets.token_bytes(32)
             key_path = self.db_path.parent / (self.db_path.stem + '.key')
-            with open(key_path, 'wb') as f:
-                f.write(self._key)
+            try:
+                with open(key_path, 'wb') as f:
+                    f.write(self._key)
+            except Exception as e:
+                raise DatabaseError(f"Failed to write keyfile '{key_path}': {e}")
     
     def load_keyfile(self) -> None:
         """Load key from keyfile."""
         key_path = self.db_path.parent / (self.db_path.stem + '.key')
         if key_path.exists():
-            with open(key_path, 'rb') as f:
-                self._key = f.read()
+            try:
+                with open(key_path, 'rb') as f:
+                    self._key = f.read()
+            except Exception as e:
+                raise DatabaseError(f"Failed to read keyfile '{key_path}': {e}")
     
     def encrypt(self, data: bytes) -> bytes:
         """Encrypt data based on security level."""
@@ -841,6 +908,9 @@ class DBCake:
     
     def set(self, key: str, value: Any) -> None:
         """Set a key-value pair."""
+        if not key:
+            raise DatabaseError("Key cannot be empty")
+        
         # Convert value to bytes
         if isinstance(value, str):
             value_bytes = value.encode('utf-8')
@@ -849,7 +919,7 @@ class DBCake:
         else:
             try:
                 value_bytes = json.dumps(value, ensure_ascii=False).encode('utf-8')
-            except:
+            except Exception as e:
                 # Fallback for non-serializable objects
                 value_bytes = str(value).encode('utf-8')
         
@@ -861,6 +931,9 @@ class DBCake:
     
     def get(self, key: str) -> Optional[Any]:
         """Get value for key."""
+        if not key:
+            raise DatabaseError("Key cannot be empty")
+        
         value_bytes = self._backend.get(key)
         if value_bytes is None:
             return None
@@ -885,10 +958,14 @@ class DBCake:
     
     def delete(self, key: str) -> None:
         """Delete a key."""
+        if not key:
+            raise DatabaseError("Key cannot be empty")
         self._backend.delete(key)
     
     def exists(self, key: str) -> bool:
         """Check if key exists."""
+        if not key:
+            raise DatabaseError("Key cannot be empty")
         return self._backend.exists(key)
     
     def keys(self) -> List[str]:
@@ -897,6 +974,8 @@ class DBCake:
     
     def preview(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Preview records."""
+        if limit <= 0:
+            raise DatabaseError("Limit must be positive")
         return self._backend.preview(limit)
     
     def compact(self) -> None:
@@ -938,8 +1017,35 @@ class DBCake:
         self.store_format = StoreFormat(format)
         # Note: Would need to convert existing data
     
+    def reconfigure(self, path: Optional[Union[str, pathlib.Path]] = None,
+                   store_format: Optional[Union[str, StoreFormat]] = None,
+                   dataset: Optional[Union[str, DatasetMode]] = None) -> None:
+        """
+        Reconfigure the database with new settings.
+        
+        This is the method you should use instead of the non-existent 'title' method.
+        """
+        if path:
+            self.path = pathlib.Path(path)
+        
+        if store_format:
+            self.store_format = StoreFormat(store_format)
+        
+        if dataset:
+            self.dataset_mode = DatasetMode(dataset)
+        
+        # Reinitialize backend with new settings
+        if self.dataset_mode == DatasetMode.CENTERILIZED:
+            self._backend = AppendOnlyStorage(self.path, self.store_format)
+        else:
+            storage_dir = self.path.parent / (self.path.stem + '.d')
+            self._backend = DecentralizedStorage(storage_dir, self.store_format)
+    
     def pretty_print_preview(self, limit: int = 10) -> None:
         """Pretty print preview."""
+        if limit <= 0:
+            raise DatabaseError("Limit must be positive")
+            
         preview = self.preview(limit)
         if not preview:
             print("No records found.")
@@ -968,19 +1074,40 @@ class Client:
                  base_url: str, 
                  api_key: Optional[str] = None,
                  fernet_key: Optional[str] = None):
+        if not REQUESTS_AVAILABLE:
+            raise ImportError(
+                "The 'requests' package is required for the HTTP client. "
+                "Install it with: pip install requests"
+            )
+        
+        if not base_url:
+            raise ConfigurationError("Base URL cannot be empty")
+        
         self.base_url = base_url.rstrip('/')
         self.api_key = api_key
         self.session = None
         self.fernet = None
         
-        if fernet_key and CRYPTOGRAPHY_AVAILABLE:
-            self.fernet = Fernet(fernet_key.encode('utf-8'))
+        if fernet_key:
+            if not CRYPTOGRAPHY_AVAILABLE:
+                raise ImportError(
+                    "The 'cryptography' package is required for Fernet encryption. "
+                    "Install it with: pip install cryptography"
+                )
+            try:
+                self.fernet = Fernet(fernet_key.encode('utf-8'))
+            except Exception as e:
+                raise ConfigurationError(f"Invalid Fernet key: {e}")
     
     def _get_session(self):
         """Lazy session creation."""
         if self.session is None:
             import requests
             self.session = requests.Session()
+            self.session.headers.update({
+                'User-Agent': 'DBCake-Secrets-Client/1.3.0',
+                'Content-Type': 'application/json'
+            })
             if self.api_key:
                 self.session.headers.update({'Authorization': f'Bearer {self.api_key}'})
         return self.session
@@ -990,12 +1117,18 @@ class Client:
             value: str, 
             tags: Optional[List[str]] = None) -> Secret:
         """Set a secret."""
+        if not name:
+            raise SecretClientError("Secret name cannot be empty")
+        
         url = f"{self.base_url}/secrets"
         
         # Encrypt locally if Fernet is configured
         if self.fernet:
-            value_enc = self.fernet.encrypt(value.encode('utf-8'))
-            value = base64.b64encode(value_enc).decode('ascii')
+            try:
+                value_enc = self.fernet.encrypt(value.encode('utf-8'))
+                value = base64.b64encode(value_enc).decode('ascii')
+            except Exception as e:
+                raise SecretClientError(f"Failed to encrypt secret: {e}")
         
         data = {
             'name': name,
@@ -1003,55 +1136,117 @@ class Client:
             'tags': tags or []
         }
         
-        session = self._get_session()
-        response = session.post(url, json=data)
-        response.raise_for_status()
-        
-        result = response.json()
-        return Secret(
-            name=result['name'],
-            created_at=result.get('created_at'),
-            updated_at=result.get('updated_at'),
-            tags=result.get('tags')
-        )
+        try:
+            session = self._get_session()
+            response = session.post(url, json=data, timeout=30)
+            response.raise_for_status()
+            
+            result = response.json()
+            return Secret(
+                name=result['name'],
+                created_at=result.get('created_at'),
+                updated_at=result.get('updated_at'),
+                tags=result.get('tags')
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise NetworkError(
+                f"Failed to connect to secrets server at {self.base_url}. "
+                f"Please check if the server is running and accessible. "
+                f"Error: {e}"
+            )
+        except requests.exceptions.Timeout:
+            raise NetworkError(
+                f"Request to {self.base_url} timed out after 30 seconds. "
+                f"The server might be slow or unresponsive."
+            )
+        except requests.exceptions.RequestException as e:
+            raise SecretClientError(f"Failed to set secret '{name}': {e}")
+        except json.JSONDecodeError as e:
+            raise SecretClientError(f"Invalid JSON response from server: {e}")
+        except KeyError as e:
+            raise SecretClientError(f"Missing expected field in server response: {e}")
     
     def get(self, 
             name: str, 
             reveal: bool = False) -> Secret:
         """Get a secret."""
+        if not name:
+            raise SecretClientError("Secret name cannot be empty")
+        
         url = f"{self.base_url}/secrets/{name}"
         if reveal:
             url += "?reveal=true"
         
-        session = self._get_session()
-        response = session.get(url)
-        response.raise_for_status()
-        
-        result = response.json()
-        
-        # Decrypt if Fernet is configured and value is present
-        value = result.get('value')
-        if value and self.fernet and reveal:
-            try:
-                value_enc = base64.b64decode(value.encode('ascii'))
-                value = self.fernet.decrypt(value_enc).decode('utf-8')
-            except:
-                pass
-        
-        return Secret(
-            name=result['name'],
-            value=value if reveal else None,
-            created_at=result.get('created_at'),
-            updated_at=result.get('updated_at'),
-            tags=result.get('tags')
-        )
+        try:
+            session = self._get_session()
+            response = session.get(url, timeout=30)
+            
+            if response.status_code == 404:
+                raise SecretClientError(f"Secret '{name}' not found on server")
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            # Decrypt if Fernet is configured and value is present
+            value = result.get('value')
+            if value and self.fernet and reveal:
+                try:
+                    value_enc = base64.b64decode(value.encode('ascii'))
+                    value = self.fernet.decrypt(value_enc).decode('utf-8')
+                except Exception as e:
+                    raise SecretClientError(f"Failed to decrypt secret: {e}")
+            
+            return Secret(
+                name=result['name'],
+                value=value if reveal else None,
+                created_at=result.get('created_at'),
+                updated_at=result.get('updated_at'),
+                tags=result.get('tags')
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise NetworkError(
+                f"Failed to connect to secrets server at {self.base_url}. "
+                f"Please check if the server is running and accessible. "
+                f"Error: {e}"
+            )
+        except requests.exceptions.Timeout:
+            raise NetworkError(
+                f"Request to {self.base_url} timed out after 30 seconds. "
+                f"The server might be slow or unresponsive."
+            )
+        except requests.exceptions.RequestException as e:
+            raise SecretClientError(f"Failed to get secret '{name}': {e}")
+        except json.JSONDecodeError as e:
+            raise SecretClientError(f"Invalid JSON response from server: {e}")
     
     def delete(self, name: str) -> None:
         """Delete a secret."""
+        if not name:
+            raise SecretClientError("Secret name cannot be empty")
+        
         url = f"{self.base_url}/secrets/{name}"
-        session = self._get_session()
-        response = session.delete(url)
-        response.raise_for_status()
+        
+        try:
+            session = self._get_session()
+            response = session.delete(url, timeout=30)
+            
+            if response.status_code == 404:
+                raise SecretClientError(f"Secret '{name}' not found on server")
+            
+            response.raise_for_status()
+        except requests.exceptions.ConnectionError as e:
+            raise NetworkError(
+                f"Failed to connect to secrets server at {self.base_url}. "
+                f"Please check if the server is running and accessible. "
+                f"Error: {e}"
+            )
+        except requests.exceptions.Timeout:
+            raise NetworkError(
+                f"Request to {self.base_url} timed out after 30 seconds. "
+                f"The server might be slow or unresponsive."
+            )
+        except requests.exceptions.RequestException as e:
+            raise SecretClientError(f"Failed to delete secret '{name}': {e}")
     
     def list(self) -> List[Secret]:
         """List all secrets (simplified)."""
@@ -1071,20 +1266,34 @@ if AIOHTTP_AVAILABLE:
             self.api_key = api_key
             self.fernet = None
             
-            if fernet_key and CRYPTOGRAPHY_AVAILABLE:
-                self.fernet = Fernet(fernet_key.encode('utf-8'))
+            if fernet_key:
+                if not CRYPTOGRAPHY_AVAILABLE:
+                    raise ImportError(
+                        "The 'cryptography' package is required for Fernet encryption. "
+                        "Install it with: pip install cryptography"
+                    )
+                try:
+                    self.fernet = Fernet(fernet_key.encode('utf-8'))
+                except Exception as e:
+                    raise ConfigurationError(f"Invalid Fernet key: {e}")
         
         async def set(self, 
                       name: str, 
                       value: str, 
                       tags: Optional[List[str]] = None) -> Secret:
             """Set a secret."""
+            if not name:
+                raise SecretClientError("Secret name cannot be empty")
+            
             url = f"{self.base_url}/secrets"
             
             # Encrypt locally if Fernet is configured
             if self.fernet:
-                value_enc = self.fernet.encrypt(value.encode('utf-8'))
-                value = base64.b64encode(value_enc).decode('ascii')
+                try:
+                    value_enc = self.fernet.encrypt(value.encode('utf-8'))
+                    value = base64.b64encode(value_enc).decode('ascii')
+                except Exception as e:
+                    raise SecretClientError(f"Failed to encrypt secret: {e}")
             
             data = {
                 'name': name,
@@ -1092,55 +1301,136 @@ if AIOHTTP_AVAILABLE:
                 'tags': tags or []
             }
             
-            headers = {}
+            headers = {
+                'User-Agent': 'DBCake-Secrets-Client/1.3.0',
+                'Content-Type': 'application/json'
+            }
             if self.api_key:
                 headers['Authorization'] = f'Bearer {self.api_key}'
             
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=data, headers=headers) as response:
-                    response.raise_for_status()
-                    result = await response.json()
-                    
-                    return Secret(
-                        name=result['name'],
-                        created_at=result.get('created_at'),
-                        updated_at=result.get('updated_at'),
-                        tags=result.get('tags')
-                    )
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=data, headers=headers, timeout=30) as response:
+                        response.raise_for_status()
+                        result = await response.json()
+                        
+                        return Secret(
+                            name=result['name'],
+                            created_at=result.get('created_at'),
+                            updated_at=result.get('updated_at'),
+                            tags=result.get('tags')
+                        )
+            except aiohttp.ClientConnectionError as e:
+                raise NetworkError(
+                    f"Failed to connect to secrets server at {self.base_url}. "
+                    f"Please check if the server is running and accessible. "
+                    f"Error: {e}"
+                )
+            except aiohttp.ClientTimeoutError:
+                raise NetworkError(
+                    f"Request to {self.base_url} timed out after 30 seconds. "
+                    f"The server might be slow or unresponsive."
+                )
+            except aiohttp.ClientResponseError as e:
+                raise SecretClientError(f"Failed to set secret '{name}': {e}")
+            except json.JSONDecodeError as e:
+                raise SecretClientError(f"Invalid JSON response from server: {e}")
+            except KeyError as e:
+                raise SecretClientError(f"Missing expected field in server response: {e}")
         
         async def get(self, 
                       name: str, 
                       reveal: bool = False) -> Secret:
             """Get a secret."""
+            if not name:
+                raise SecretClientError("Secret name cannot be empty")
+            
             url = f"{self.base_url}/secrets/{name}"
             if reveal:
                 url += "?reveal=true"
             
-            headers = {}
+            headers = {
+                'User-Agent': 'DBCake-Secrets-Client/1.3.0',
+                'Content-Type': 'application/json'
+            }
             if self.api_key:
                 headers['Authorization'] = f'Bearer {self.api_key}'
             
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers) as response:
-                    response.raise_for_status()
-                    result = await response.json()
-                    
-                    # Decrypt if Fernet is configured and value is present
-                    value = result.get('value')
-                    if value and self.fernet and reveal:
-                        try:
-                            value_enc = base64.b64decode(value.encode('ascii'))
-                            value = self.fernet.decrypt(value_enc).decode('utf-8')
-                        except:
-                            pass
-                    
-                    return Secret(
-                        name=result['name'],
-                        value=value if reveal else None,
-                        created_at=result.get('created_at'),
-                        updated_at=result.get('updated_at'),
-                        tags=result.get('tags')
-                    )
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers, timeout=30) as response:
+                        if response.status == 404:
+                            raise SecretClientError(f"Secret '{name}' not found on server")
+                        
+                        response.raise_for_status()
+                        result = await response.json()
+                        
+                        # Decrypt if Fernet is configured and value is present
+                        value = result.get('value')
+                        if value and self.fernet and reveal:
+                            try:
+                                value_enc = base64.b64decode(value.encode('ascii'))
+                                value = self.fernet.decrypt(value_enc).decode('utf-8')
+                            except Exception as e:
+                                raise SecretClientError(f"Failed to decrypt secret: {e}")
+                        
+                        return Secret(
+                            name=result['name'],
+                            value=value if reveal else None,
+                            created_at=result.get('created_at'),
+                            updated_at=result.get('updated_at'),
+                            tags=result.get('tags')
+                        )
+            except aiohttp.ClientConnectionError as e:
+                raise NetworkError(
+                    f"Failed to connect to secrets server at {self.base_url}. "
+                    f"Please check if the server is running and accessible. "
+                    f"Error: {e}"
+                )
+            except aiohttp.ClientTimeoutError:
+                raise NetworkError(
+                    f"Request to {self.base_url} timed out after 30 seconds. "
+                    f"The server might be slow or unresponsive."
+                )
+            except aiohttp.ClientResponseError as e:
+                raise SecretClientError(f"Failed to get secret '{name}': {e}")
+            except json.JSONDecodeError as e:
+                raise SecretClientError(f"Invalid JSON response from server: {e}")
+        
+        async def delete(self, name: str) -> None:
+            """Delete a secret."""
+            if not name:
+                raise SecretClientError("Secret name cannot be empty")
+            
+            url = f"{self.base_url}/secrets/{name}"
+            
+            headers = {
+                'User-Agent': 'DBCake-Secrets-Client/1.3.0',
+                'Content-Type': 'application/json'
+            }
+            if self.api_key:
+                headers['Authorization'] = f'Bearer {self.api_key}'
+            
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.delete(url, headers=headers, timeout=30) as response:
+                        if response.status == 404:
+                            raise SecretClientError(f"Secret '{name}' not found on server")
+                        
+                        response.raise_for_status()
+            except aiohttp.ClientConnectionError as e:
+                raise NetworkError(
+                    f"Failed to connect to secrets server at {self.base_url}. "
+                    f"Please check if the server is running and accessible. "
+                    f"Error: {e}"
+                )
+            except aiohttp.ClientTimeoutError:
+                raise NetworkError(
+                    f"Request to {self.base_url} timed out after 30 seconds. "
+                    f"The server might be slow or unresponsive."
+                )
+            except aiohttp.ClientResponseError as e:
+                raise SecretClientError(f"Failed to delete secret '{name}': {e}")
         
         @classmethod
         def from_env(cls) -> 'AsyncClient':
@@ -1227,6 +1517,15 @@ def cli():
     rotate_parser.add_argument('file', help='Database file')
     rotate_parser.add_argument('--interactive', action='store_true', help='Interactive mode')
     
+    # db reconfigure (NEW - replaces the non-existent 'title' method)
+    reconfigure_parser = db_subparsers.add_parser('reconfigure', help='Reconfigure database')
+    reconfigure_parser.add_argument('file', help='Database file')
+    reconfigure_parser.add_argument('--new-path', help='New database file path')
+    reconfigure_parser.add_argument('--format', choices=['binary', 'bits01', 'dec', 'hex'], 
+                                   help='New storage format')
+    reconfigure_parser.add_argument('--mode', choices=['centerilized', 'decentralized'], 
+                                   help='New storage mode')
+    
     # db reveal
     reveal_parser = db_subparsers.add_parser('reveal', help='Reveal in file manager')
     reveal_parser.add_argument('file', help='Database file')
@@ -1239,25 +1538,25 @@ def cli():
     secret_set = secret_subparsers.add_parser('set', help='Set secret')
     secret_set.add_argument('name', help='Secret name')
     secret_set.add_argument('value', help='Secret value')
-    secret_set.add_argument('--url', help='API URL')
+    secret_set.add_argument('--url', default='http://localhost:8000', help='API URL (default: http://localhost:8000)')
     secret_set.add_argument('--api-key', help='API key')
     
     # secret get
     secret_get = secret_subparsers.add_parser('get', help='Get secret')
     secret_get.add_argument('name', help='Secret name')
     secret_get.add_argument('--reveal', action='store_true', help='Reveal value')
-    secret_get.add_argument('--url', help='API URL')
+    secret_get.add_argument('--url', default='http://localhost:8000', help='API URL (default: http://localhost:8000)')
     secret_get.add_argument('--api-key', help='API key')
     
     # secret list
     secret_list = secret_subparsers.add_parser('list', help='List secrets')
-    secret_list.add_argument('--url', help='API URL')
+    secret_list.add_argument('--url', default='http://localhost:8000', help='API URL (default: http://localhost:8000)')
     secret_list.add_argument('--api-key', help='API key')
     
     # secret delete
     secret_delete = secret_subparsers.add_parser('delete', help='Delete secret')
     secret_delete.add_argument('name', help='Secret name')
-    secret_delete.add_argument('--url', help='API URL')
+    secret_delete.add_argument('--url', default='http://localhost:8000', help='API URL (default: http://localhost:8000)')
     secret_delete.add_argument('--api-key', help='API key')
     
     # Installer command
@@ -1370,6 +1669,15 @@ def handle_db_command(args):
         else:
             print("Use --interactive for security")
     
+    elif args.db_command == 'reconfigure':
+        db = DBCake(args.file)
+        db.reconfigure(
+            path=args.new_path,
+            store_format=args.format,
+            dataset=args.mode
+        )
+        print("Database reconfigured")
+    
     elif args.db_command == 'reveal':
         path = pathlib.Path(args.file).absolute()
         if platform.system() == 'Windows':
@@ -1387,31 +1695,97 @@ def handle_secret_command(args):
     base_url = args.url or os.getenv('DBCAKE_URL', 'http://localhost:8000')
     api_key = args.api_key or os.getenv('DBCAKE_API_KEY')
     
-    if not api_key:
-        print("Error: API key required. Use --api-key or set DBCAKE_API_KEY env var.")
+    # Provide helpful message for default URL
+    if base_url == 'http://localhost:8000':
+        print("Note: Using default localhost URL. Make sure you have a secrets server running.")
+        print("To use a different server, specify --url or set DBCAKE_URL environment variable.")
+        print()
+    
+    if not REQUESTS_AVAILABLE:
+        print("Error: The 'requests' package is required for the HTTP client.")
+        print("Install it with: pip install requests")
         return
     
-    client = Client(base_url, api_key)
+    try:
+        client = Client(base_url, api_key)
+    except ImportError as e:
+        print(f"Error: {e}")
+        return
+    except ConfigurationError as e:
+        print(f"Configuration error: {e}")
+        return
     
     if args.secret_command == 'set':
-        secret = client.set(args.name, args.value)
-        print(f"Secret '{secret.name}' created")
+        try:
+            secret = client.set(args.name, args.value)
+            print(f"✓ Secret '{secret.name}' created successfully")
+        except NetworkError as e:
+            print(f"✗ Network error: {e}")
+            print("  Make sure the secrets server is running and accessible.")
+            print(f"  URL: {base_url}")
+        except SecretClientError as e:
+            print(f"✗ Failed to create secret: {e}")
+        except Exception as e:
+            print(f"✗ Unexpected error: {e}")
     
     elif args.secret_command == 'get':
-        secret = client.get(args.name, reveal=args.reveal)
-        if args.reveal and secret.value:
-            print(f"{secret.name}: {secret.value}")
-        else:
-            print(f"Secret '{secret.name}' retrieved (use --reveal to see value)")
+        try:
+            secret = client.get(args.name, reveal=args.reveal)
+            if args.reveal and secret.value:
+                print(f"Secret '{secret.name}': {secret.value}")
+            else:
+                print(f"✓ Secret '{secret.name}' retrieved")
+                if secret.created_at:
+                    print(f"  Created: {secret.created_at}")
+                if secret.updated_at:
+                    print(f"  Updated: {secret.updated_at}")
+                if secret.tags:
+                    print(f"  Tags: {', '.join(secret.tags)}")
+        except NetworkError as e:
+            print(f"✗ Network error: {e}")
+            print("  Make sure the secrets server is running and accessible.")
+            print(f"  URL: {base_url}")
+        except SecretClientError as e:
+            print(f"✗ Failed to get secret: {e}")
+        except Exception as e:
+            print(f"✗ Unexpected error: {e}")
     
     elif args.secret_command == 'list':
-        secrets = client.list()
-        for secret in secrets:
-            print(secret.name)
+        try:
+            secrets = client.list()
+            if not secrets:
+                print("No secrets found")
+            else:
+                print(f"Found {len(secrets)} secrets:")
+                for secret in secrets:
+                    print(f"  - {secret.name}")
+        except NetworkError as e:
+            print(f"✗ Network error: {e}")
+            print("  Make sure the secrets server is running and accessible.")
+            print(f"  URL: {base_url}")
+        except SecretClientError as e:
+            print(f"✗ Failed to list secrets: {e}")
+        except Exception as e:
+            print(f"✗ Unexpected error: {e}")
     
     elif args.secret_command == 'delete':
-        client.delete(args.name)
-        print(f"Secret '{args.name}' deleted")
+        try:
+            # Confirm deletion
+            confirm = input(f"Are you sure you want to delete secret '{args.name}'? (yes/no): ")
+            if confirm.lower() != 'yes':
+                print("Deletion cancelled")
+                return
+            
+            client.delete(args.name)
+            print(f"✓ Secret '{args.name}' deleted successfully")
+        except NetworkError as e:
+            print(f"✗ Network error: {e}")
+            print("  Make sure the secrets server is running and accessible.")
+            print(f"  URL: {base_url}")
+        except SecretClientError as e:
+            print(f"✗ Failed to delete secret: {e}")
+        except Exception as e:
+            print(f"✗ Unexpected error: {e}")
     
     else:
         print("Unknown secret command")
@@ -1510,6 +1884,18 @@ def run_installer():
                                  font=("Arial", 9))
             async_desc.grid(row=1, column=1, sticky="w", pady=5)
             
+            # requests package
+            self.requests_var = tk.BooleanVar(value=not REQUESTS_AVAILABLE)
+            requests_check = ttk.Checkbutton(frame, text="requests", 
+                                           variable=self.requests_var,
+                                           command=self.update_install_button)
+            requests_check.grid(row=2, column=0, sticky="w", pady=5)
+            
+            requests_desc = tk.Label(frame, 
+                                   text="HTTP client for secrets API (required for Client)",
+                                   font=("Arial", 9))
+            requests_desc.grid(row=2, column=1, sticky="w", pady=5)
+            
             # Status
             self.status = tk.StringVar(value="Ready to install")
             status_label = tk.Label(root, textvariable=self.status,
@@ -1533,7 +1919,7 @@ def run_installer():
         
         def update_install_button(self):
             """Update install button state."""
-            if self.crypto_var.get() or self.async_var.get():
+            if self.crypto_var.get() or self.async_var.get() or self.requests_var.get():
                 self.install_button.config(state="normal")
             else:
                 self.install_button.config(state="disabled")
@@ -1545,6 +1931,8 @@ def run_installer():
                 packages.append("cryptography")
             if self.async_var.get():
                 packages.append("aiohttp")
+            if self.requests_var.get():
+                packages.append("requests")
             
             if not packages:
                 return
